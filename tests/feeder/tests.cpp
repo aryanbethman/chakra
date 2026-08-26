@@ -1,4 +1,7 @@
 #include <gtest/gtest.h>
+
+#include <fstream>
+#include <iterator>
 #include "et_feeder.h"
 
 class ETFeederTest : public ::testing::Test {
@@ -16,6 +19,22 @@ class ETFeederTest : public ::testing::Test {
 
   Chakra::ETFeeder* trace;
 };
+
+TEST(ETFeederMemoryTest, MemoryPayloadMatchesFileTrace) {
+  std::ifstream input("tests/data/chakra.0.et", std::ios::binary);
+  ASSERT_TRUE(input.good());
+  auto payload = std::make_shared<std::string>(
+      std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+
+  Chakra::ETFeeder trace(payload);
+  auto first = trace.getNextIssuableNode();
+  ASSERT_EQ(first->id(), 216);
+  ASSERT_EQ(first->type(), ChakraProtoMsg::COMP_NODE);
+
+  auto second = trace.getNextIssuableNode();
+  ASSERT_EQ(second->id(), 432);
+  ASSERT_EQ(second->type(), ChakraProtoMsg::COMM_COLL_NODE);
+}
 
 TEST_F(ETFeederTest, ConstructorNodeIDTest) {
   SetUp("tests/data/chakra.0.et");

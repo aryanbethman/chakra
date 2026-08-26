@@ -95,6 +95,7 @@ ProtoInputStream::ProtoInputStream(const std::string& filename)
       fileName(filename),
       useGzip(false),
       wrappedFileStream(NULL),
+      wrappedMemoryStream(NULL),
       gzipStream(NULL),
       zeroCopyStream(NULL) {
   if (!fileStream.good())
@@ -112,11 +113,32 @@ ProtoInputStream::ProtoInputStream(const std::string& filename)
   createStreams();
 }
 
+ProtoInputStream::ProtoInputStream(std::shared_ptr<const std::string> payload)
+    : fileName("<memory>"),
+      useGzip(false),
+      wrappedFileStream(NULL),
+      wrappedMemoryStream(NULL),
+      gzipStream(NULL),
+      zeroCopyStream(NULL),
+      memoryPayload(std::move(payload)) {
+  if (memoryPayload == nullptr) {
+    panic("Cannot create an in-memory input stream from null payload\n");
+  }
+  createStreams();
+}
+
 void ProtoInputStream::createStreams() {
   // All streams should be NULL at this point
   assert(
       wrappedFileStream == NULL && gzipStream == NULL &&
       zeroCopyStream == NULL);
+
+  if (memoryPayload != nullptr) {
+    wrappedMemoryStream = new io::ArrayInputStream(
+        memoryPayload->data(), static_cast<int>(memoryPayload->size()));
+    zeroCopyStream = wrappedMemoryStream;
+    return;
+  }
 
   // Wrap the input file in a zero copy stream, that in turn is
   // wrapped in a gzip stream if the filename ends with .gz. The
@@ -136,19 +158,31 @@ void ProtoInputStream::destroyStreams() {
     delete gzipStream;
     gzipStream = NULL;
   }
-  delete wrappedFileStream;
-  wrappedFileStream = NULL;
+  if (wrappedMemoryStream != NULL) {
+    delete wrappedMemoryStream;
+    wrappedMemoryStream = NULL;
+  }
+  if (wrappedFileStream != NULL) {
+    delete wrappedFileStream;
+    wrappedFileStream = NULL;
+  }
 
   zeroCopyStream = NULL;
 }
 
 ProtoInputStream::~ProtoInputStream() {
   destroyStreams();
-  fileStream.close();
+  if (fileStream.is_open()) {
+    fileStream.close();
+  }
 }
 
 void ProtoInputStream::reset() {
   destroyStreams();
+  if (memoryPayload != nullptr) {
+    createStreams();
+    return;
+  }
   // seek to the start of the input file and clear any flags
   fileStream.clear();
   fileStream.seekg(0, std::ifstream::beg);
@@ -156,7 +190,7 @@ void ProtoInputStream::reset() {
 }
 
 bool ProtoInputStream::is_open() {
-  return fileStream.is_open();
+  return memoryPayload != nullptr || fileStream.is_open();
 }
 
 bool ProtoInputStream::read(Message& msg) {
