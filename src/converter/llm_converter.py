@@ -1,6 +1,7 @@
 import logging
-from io import TextIOWrapper
-from typing import Any, List
+from contextlib import nullcontext
+from io import BytesIO, TextIOWrapper
+from typing import Any, Dict, List
 from enum import Enum
 
 from ...schema.protobuf.et_def_pb2 import *
@@ -87,6 +88,26 @@ class LLMConverter:
         # For send & recv nodes
         self.next_comm_tag = 0
         self.comm_tag_dict = dict()
+        self._payload_streams = None
+
+    def _reset_conversion_state(self) -> None:
+        self.next_node_id = 0
+        self.next_comm_tag = 0
+        self.comm_tag_dict = dict()
+
+    def _open_output_stream(self, npu_id: int):
+        """Return a binary ET sink for a rank.
+
+        The legacy converter writes a rank-specific file. The in-memory API
+        swaps only this sink, so both paths use the same encoding logic.
+        """
+        if self._payload_streams is None:
+            output_filename = "%s.%d.et" % (self.output_filename, npu_id)
+            return open(output_filename, "wb")
+
+        stream = BytesIO()
+        self._payload_streams[npu_id] = stream
+        return nullcontext(stream)
 
     def get_global_metadata(self):
         input_text = ""
@@ -294,9 +315,8 @@ class LLMConverter:
                 layer_end = num_layers
             for npu_offset in range(npus_per_group):
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
-                output_filename = "%s.%d.et" % (self.output_filename, npu_id)
                 first_comp_node = True
-                with open(output_filename, "wb") as g:
+                with self._open_output_stream(npu_id) as g:
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
                     if evict != None:
@@ -619,10 +639,11 @@ class LLMConverter:
                 layer_end = num_layers
             for npu_offset in range(npus_per_group):
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
-                output_filename1 = "%s.%d.et" % (self.output_filename, npu_id)
-                output_filename2 = "%s.%d.et" % (self.output_filename, npu_id + self.num_npus) # sender for prefill-decode
                 first_comp_node = True
-                with open(output_filename1, "wb") as g, open(output_filename2, "wb") as s:
+                with (
+                    self._open_output_stream(npu_id) as g,
+                    self._open_output_stream(npu_id + self.num_npus) as s,
+                ):
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
                     encode_message(s, global_metadata)
@@ -842,8 +863,7 @@ class LLMConverter:
     def convert_event(self, f: TextIOWrapper, num_layers: int):
         layers: list[Layer] = self.get_layers(f)
         for npu_id in range(self.num_npus):
-            output_filename = "%s.%d.et" % (self.output_filename, npu_id)
-            with open(output_filename, "wb") as g:
+            with self._open_output_stream(npu_id) as g:
                 global_metadata = self.get_global_metadata()
                 encode_message(g, global_metadata)
                 for idx, layer in enumerate(layers):
@@ -853,7 +873,7 @@ class LLMConverter:
                     layer.comp_node = comp_node
                     encode_message(g, comp_node)
 
-    def convert(self):
+    def _convert(self) -> None:
         with open(self.input_filename, "r") as f:
             first_line = f.readline().strip().split()
             execution_type = first_line[0]
@@ -885,3 +905,26 @@ class LLMConverter:
                 self.convert_event(f, num_layers)
             else:
                 raise ValueError(f"Unsupported execution type, {execution_type}")
+
+    def convert(self) -> None:
+        """Convert the input trace to the legacy rank-specific ET files."""
+        self._reset_conversion_state()
+        self._payload_streams = None
+        self._convert()
+
+    def convert_to_payloads(self) -> Dict[int, bytes]:
+        """Convert the input trace to rank-indexed ET payloads without files.
+
+        Returned bytes are bit-for-bit equivalent to the legacy file contents
+        produced from a fresh converter with the same inputs.
+        """
+        self._reset_conversion_state()
+        self._payload_streams = {}
+        try:
+            self._convert()
+            return {
+                npu_id: stream.getvalue()
+                for npu_id, stream in self._payload_streams.items()
+            }
+        finally:
+            self._payload_streams = None
