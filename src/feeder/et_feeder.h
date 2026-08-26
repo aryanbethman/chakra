@@ -24,6 +24,7 @@ struct CompareNodes : public std::binary_function<
 class ETFeeder {
  public:
   ETFeeder(std::string filename);
+  ETFeeder(std::shared_ptr<const std::string> payload);
   ~ETFeeder();
 
   void addNode(std::shared_ptr<ETFeederNode> node);
@@ -40,6 +41,8 @@ class ETFeeder {
   void printGraph();
 
  private:
+  void initialiseTrace();
+
   ProtoInputStream trace_;
   const uint32_t window_size_;
   bool et_complete_;

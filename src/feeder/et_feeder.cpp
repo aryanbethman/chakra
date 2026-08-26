@@ -7,8 +7,17 @@ using namespace Chakra;
 
 ETFeeder::ETFeeder(string filename)
     : trace_(filename), window_size_(4096 * 256), et_complete_(false) {
-  if (!trace_.is_open()) { // Assuming a method to check if file is open
-    throw std::runtime_error("Failed to open trace file: " + filename);
+  initialiseTrace();
+}
+
+ETFeeder::ETFeeder(shared_ptr<const string> payload)
+    : trace_(std::move(payload)), window_size_(4096 * 256), et_complete_(false) {
+  initialiseTrace();
+}
+
+void ETFeeder::initialiseTrace() {
+  if (!trace_.is_open()) {
+    throw runtime_error("Failed to open execution trace");
   }
 
   try {
@@ -16,7 +25,7 @@ ETFeeder::ETFeeder(string filename)
     readNextWindow();
   } catch (const std::exception& e) {
     cerr << "Error in constructor: " << e.what() << endl;
-    throw; // Rethrow the exception for caller to handle
+    throw;
   }
 }
 

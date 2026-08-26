@@ -49,6 +49,10 @@
 #include <google/protobuf/message.h>
 
 #include <fstream>
+#include <memory>
+#include <string>
+
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 
 /**
  * A ProtoStream provides the shared functionality of the input and
@@ -138,6 +142,12 @@ class ProtoInputStream : public ProtoStream {
   ProtoInputStream(const std::string& filename);
 
   /**
+   * Create an input stream over immutable in-memory bytes. The caller retains
+   * shared ownership of the payload for the stream lifetime.
+   */
+  ProtoInputStream(std::shared_ptr<const std::string> payload);
+
+  /**
    * Destruct the input stream, and also close the underlying file
    * streams and coded streams.
    */
@@ -172,6 +182,9 @@ class ProtoInputStream : public ProtoStream {
   /// Underlying file input stream
   std::ifstream fileStream;
 
+  /// Immutable backing bytes for an in-memory stream, if selected.
+  std::shared_ptr<const std::string> memoryPayload;
+
   /// Hold on to the file name for debug messages
   const std::string fileName;
 
@@ -180,6 +193,9 @@ class ProtoInputStream : public ProtoStream {
 
   /// Zero Copy stream wrapping the STL input stream
   google::protobuf::io::IstreamInputStream* wrappedFileStream;
+
+  /// Zero Copy stream wrapping immutable in-memory payload bytes.
+  google::protobuf::io::ArrayInputStream* wrappedMemoryStream;
 
   /// Optional Gzip stream to wrap the Zero Copy stream
   google::protobuf::io::GzipInputStream* gzipStream;
