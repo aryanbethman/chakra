@@ -1,7 +1,8 @@
 import logging
 from contextlib import nullcontext
-from io import BytesIO, TextIOWrapper
-from typing import Any, Dict, List
+from io import BytesIO, StringIO, TextIOWrapper
+from typing import Any, Dict, List, Optional
+import hashlib
 from enum import Enum
 
 from ...schema.protobuf.et_def_pb2 import *
@@ -77,23 +78,34 @@ class LLMConverter:
         num_npus: int,
         npu_offset: int = 0,
         local_offloading: bool = False,
+        input_text: Optional[str] = None,
     ):
         self.input_filename = input_filename
         self.output_filename = output_filename
         self.num_npus = num_npus
         self.npu_offset = npu_offset
         self.local_offloading = local_offloading
+        self.input_text = input_text
         self.next_node_id = 0
 
         # For send & recv nodes
         self.next_comm_tag = 0
         self.comm_tag_dict = dict()
         self._payload_streams = None
+        self._template_collector = None
+        self._compact_metadata = False
+        self._global_metadata = None
 
     def _reset_conversion_state(self) -> None:
         self.next_node_id = 0
         self.next_comm_tag = 0
         self.comm_tag_dict = dict()
+        self._global_metadata = None
+
+    def _open_input(self):
+        if self.input_text is not None:
+            return StringIO(self.input_text)
+        return open(self.input_filename, "r")
 
     def _open_output_stream(self, npu_id: int):
         """Return a binary ET sink for a rank.
@@ -101,6 +113,8 @@ class LLMConverter:
         The legacy converter writes a rank-specific file. The in-memory API
         swaps only this sink, so both paths use the same encoding logic.
         """
+        if self._template_collector is not None:
+            return self._template_collector.open_rank(npu_id)
         if self._payload_streams is None:
             output_filename = "%s.%d.et" % (self.output_filename, npu_id)
             return open(output_filename, "wb")
@@ -109,16 +123,35 @@ class LLMConverter:
         self._payload_streams[npu_id] = stream
         return nullcontext(stream)
 
+    @staticmethod
+    def _emit_message(stream, message) -> None:
+        """Write a framed ET message or capture its template representation."""
+        if hasattr(stream, "write_message"):
+            stream.write_message(message)
+        else:
+            encode_message(stream, message)
+
     def get_global_metadata(self):
-        input_text = ""
-        with open(self.input_filename, "r") as input_file:
-            input_text = input_file.read()
-        attr = [
-            ChakraAttr(name="schema", string_val="1.0.2-chakra.0.0.4"),
-            ChakraAttr(name="input_file", string_val=input_text),
-        ]
-        metadata = GlobalMetadata(attr=attr)
-        return metadata
+        if self._global_metadata is None:
+            if self._compact_metadata:
+                trace_identity = hashlib.sha256(
+                    (self.input_text or "").encode("utf-8")
+                ).hexdigest()
+                attr = [
+                    ChakraAttr(name="schema", string_val="1.0.2-chakra.0.0.4"),
+                    ChakraAttr(name="trace_sha256", string_val=trace_identity),
+                ]
+            else:
+                input_text = self.input_text
+                if input_text is None:
+                    with self._open_input() as input_file:
+                        input_text = input_file.read()
+                attr = [
+                    ChakraAttr(name="schema", string_val="1.0.2-chakra.0.0.4"),
+                    ChakraAttr(name="input_file", string_val=input_text),
+                ]
+            self._global_metadata = GlobalMetadata(attr=attr)
+        return self._global_metadata
     
     def get_layers(self, f: TextIOWrapper) -> List[Layer]:
         layers: List[Layer] = []
@@ -267,7 +300,7 @@ class LLMConverter:
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
 
-    def convert_common(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
+    def convert_common(self, f: TextIOWrapper, num_layers: int, num_npu_group: int, pipeline_boundaries=None):
         layers: list[Layer] = self.get_layers(f)
 
         # vllm: check eviction or load
@@ -302,27 +335,39 @@ class LLMConverter:
             use_comm = False
         else:
             use_comm = True
-        layers_per_group = num_layers // num_npu_group
-        remain_layers = num_layers % num_npu_group
+        if pipeline_boundaries is not None:
+            # Boundaries are exclusive indices into the original operator list.
+            # Account for optional leading KV load/evict records removed above.
+            pipeline_boundaries = [boundary - ev_ld_cnt for boundary in pipeline_boundaries]
+            if (len(pipeline_boundaries) != num_npu_group or
+                    pipeline_boundaries[-1] != num_layers or
+                    any(a >= b for a, b in zip([0] + pipeline_boundaries, pipeline_boundaries))):
+                raise ValueError("invalid pipeline block boundaries")
+        else:
+            layers_per_group = num_layers // num_npu_group
+            remain_layers = num_layers % num_npu_group
 
         layer_start = 0
         layer_end = 0
 
         for npu_group in range(num_npu_group):
             layer_start = layer_end
-            layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
-            if layer_end >= num_layers:
-                layer_end = num_layers
+            if pipeline_boundaries is not None:
+                layer_end = pipeline_boundaries[npu_group]
+            else:
+                layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
+                if layer_end >= num_layers:
+                    layer_end = num_layers
             for npu_offset in range(npus_per_group):
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
                 first_comp_node = True
                 with self._open_output_stream(npu_id) as g:
                     global_metadata = self.get_global_metadata()
-                    encode_message(g, global_metadata)
+                    self._emit_message(g, global_metadata)
                     if evict != None:
-                        encode_message(g, evict)
+                        self._emit_message(g, evict)
                     if load != None:
-                        encode_message(g, load)
+                        self._emit_message(g, load)
                     if npu_group == 0:
                         # Load Input
                         input_load_node = self.get_memory_load_node(
@@ -331,7 +376,7 @@ class LLMConverter:
                             layers[layer_start].input_memory_loc,
                             layers[layer_start].input_memory_size,
                         )
-                        encode_message(g, input_load_node)                  
+                        self._emit_message(g, input_load_node)                  
                     else:
                         if layers[layer_start].is_expert or layers[layer_start].is_pim:
                             # Receive input (from the previous layer in another npu group)
@@ -343,7 +388,7 @@ class LLMConverter:
                                 comm_src=npu_id - npus_per_group,
                                 comm_dst=npu_id
                             )
-                            encode_message(g, receive_input_node)
+                            self._emit_message(g, receive_input_node)
                         else:
                             # Receive input (from the previous layer in another npu group)
                             receive_input_node = self.get_comm_node(
@@ -354,7 +399,7 @@ class LLMConverter:
                                 comm_src=npu_id - npus_per_group,
                                 comm_dst=npu_id
                             )
-                            encode_message(g, receive_input_node)
+                            self._emit_message(g, receive_input_node)
 
                     expert_start = False
                     pim_start = False
@@ -377,7 +422,7 @@ class LLMConverter:
                                 layers[layer_num].weight_memory_node = weight_load_node
                                 if expert_start:
                                     self.add_parent(weight_load_node, comp_node) # dependent to previous comp_node due to gate function
-                                encode_message(g, weight_load_node)
+                                self._emit_message(g, weight_load_node)
                             # Compute
                             if layers[layer_num].comp_time != 0 and not pim_start: # pim computation is handled pim_comp_node
                                 comp_node = self.get_comp_node(
@@ -432,7 +477,7 @@ class LLMConverter:
                                         pim_comp_nodes = [] # reset pim comp nodes
                                         last_batch_type = layers[layer_num].misc
 
-                                encode_message(g, comp_node)
+                                self._emit_message(g, comp_node)
 
                             # PIM compute
                             if pim_start:
@@ -446,7 +491,7 @@ class LLMConverter:
                                 pim_comp_nodes.append(pim_comp_node)
                                 for parent in pim_parent_nodes:
                                     self.add_parent(pim_comp_node, parent)
-                                encode_message(g, pim_comp_node)
+                                self._emit_message(g, pim_comp_node)
 
                             # Communication (if required)
                             if layers[layer_num].comm_type != "NONE" and use_comm:
@@ -456,7 +501,7 @@ class LLMConverter:
                                 layers[layer_num].comm_node = comm_coll_node
                                 if layers[layer_num].comp_time != 0:
                                     self.add_parent(comm_coll_node, comp_node)
-                                encode_message(g, comm_coll_node)
+                                self._emit_message(g, comm_coll_node)
                             # add layer_num
                             layer_num += 1
                         # expert layer starts
@@ -466,7 +511,7 @@ class LLMConverter:
                                 comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size)
                                 layers[layer_num].comm_node = comm_coll_node
                                 self.add_parent(comm_coll_node, comp_node)
-                                encode_message(g, comm_coll_node)
+                                self._emit_message(g, comm_coll_node)
                             expert_start = True
                             # check expert end
                             if layers[layer_num].expert_num == 'END':
@@ -478,7 +523,7 @@ class LLMConverter:
                                     comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size)
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
-                                    encode_message(g, comm_coll_node)
+                                    self._emit_message(g, comm_coll_node)
                                 continue
                             # round robin assignment
                             expert_id = int(layers[layer_num].expert_num) % npus_per_group
@@ -555,7 +600,7 @@ class LLMConverter:
                             self.add_parent(output_store_node, comp_node)
                         else:
                             self.add_parent(output_store_node, layers[layer_end - 2].comp_node)
-                        encode_message(g, output_store_node)
+                        self._emit_message(g, output_store_node)
                     else:
                         if layers[layer_end - 1].is_expert or layers[layer_end - 1].is_pim:
                             # Send output (to the next layer in another npu group)
@@ -587,10 +632,11 @@ class LLMConverter:
                             self.add_parent(send_output_node, comp_node)
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
-                        encode_message(g, send_output_node)
-            remain_layers -= 1
+                        self._emit_message(g, send_output_node)
+            if pipeline_boundaries is None:
+                remain_layers -= 1
     
-    def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
+    def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int, pipeline_boundaries=None):
         layers: list[Layer] = self.get_layers(f)
         # There will be no pim operation in prefill (PIM cannot perform GEMM)
 
@@ -626,17 +672,26 @@ class LLMConverter:
             use_comm = False
         else:
             use_comm = True
-        layers_per_group = num_layers // num_npu_group
-        remain_layers = num_layers % num_npu_group
+        if pipeline_boundaries is not None:
+            if (len(pipeline_boundaries) != num_npu_group or
+                    pipeline_boundaries[-1] != num_layers or
+                    any(a >= b for a, b in zip([0] + pipeline_boundaries, pipeline_boundaries))):
+                raise ValueError("invalid pipeline block boundaries")
+        else:
+            layers_per_group = num_layers // num_npu_group
+            remain_layers = num_layers % num_npu_group
 
         layer_start = 0
         layer_end = 0
 
         for npu_group in range(num_npu_group):
             layer_start = layer_end
-            layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
-            if layer_end >= num_layers:
-                layer_end = num_layers
+            if pipeline_boundaries is not None:
+                layer_end = pipeline_boundaries[npu_group]
+            else:
+                layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
+                if layer_end >= num_layers:
+                    layer_end = num_layers
             for npu_offset in range(npus_per_group):
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
                 first_comp_node = True
@@ -645,12 +700,12 @@ class LLMConverter:
                     self._open_output_stream(npu_id + self.num_npus) as s,
                 ):
                     global_metadata = self.get_global_metadata()
-                    encode_message(g, global_metadata)
-                    encode_message(s, global_metadata)
+                    self._emit_message(g, global_metadata)
+                    self._emit_message(s, global_metadata)
                     if evict != None:
-                        encode_message(g, evict)
+                        self._emit_message(g, evict)
                     if load != None:
-                        encode_message(g, load)
+                        self._emit_message(g, load)
                     if npu_group == 0:
                         # Load Input
                         input_load_node = self.get_memory_load_node(
@@ -659,7 +714,7 @@ class LLMConverter:
                             layers[layer_start].input_memory_loc,
                             layers[layer_start].input_memory_size,
                         )
-                        encode_message(g, input_load_node)                  
+                        self._emit_message(g, input_load_node)                  
                     else:
                         if layers[layer_start].is_expert:
                             # Receive input (from the previous layer in another npu group)
@@ -671,7 +726,7 @@ class LLMConverter:
                                 comm_src=npu_id - npus_per_group,
                                 comm_dst=npu_id
                             )
-                            encode_message(g, receive_input_node)
+                            self._emit_message(g, receive_input_node)
                         else:
                             # Receive input (from the previous layer in another npu group)
                             receive_input_node = self.get_comm_node(
@@ -682,7 +737,7 @@ class LLMConverter:
                                 comm_src=npu_id - npus_per_group,
                                 comm_dst=npu_id
                             )
-                            encode_message(g, receive_input_node)
+                            self._emit_message(g, receive_input_node)
 
                     expert_start = False
                     layer_num = layer_start
@@ -699,7 +754,7 @@ class LLMConverter:
                                 layers[layer_num].weight_memory_node = weight_load_node
                                 if expert_start:
                                     self.add_parent(weight_load_node, comp_node) # dependent to previous comp_node due to gate function
-                                encode_message(g, weight_load_node)
+                                self._emit_message(g, weight_load_node)
                             
                             # Compute
                             if layers[layer_num].comp_time != 0:
@@ -730,7 +785,7 @@ class LLMConverter:
                                     else:
                                         self.add_parent(comp_node, layers[layer_num - 2].comp_node)
                                 
-                                encode_message(g, comp_node)
+                                self._emit_message(g, comp_node)
 
                                 # Send KV cache after each kv_proj
                                 if "v_proj" in layers[layer_num].name:
@@ -744,7 +799,7 @@ class LLMConverter:
                                         id=layer_num
                                     )
                                     self.add_parent(send_kv_node, comp_node)
-                                    encode_message(g, send_kv_node)
+                                    self._emit_message(g, send_kv_node)
 
                                     recv_kv_node = self.get_comm_node(
                                         is_send=False,
@@ -755,7 +810,7 @@ class LLMConverter:
                                         comm_dst=npu_id + self.num_npus,
                                         id=layer_num
                                     )
-                                    encode_message(s, recv_kv_node)
+                                    self._emit_message(s, recv_kv_node)
 
                             # Communication (if required)
                             if layers[layer_num].comm_type != "NONE" and use_comm:
@@ -765,7 +820,7 @@ class LLMConverter:
                                 layers[layer_num].comm_node = comm_coll_node
                                 if layers[layer_num].comp_time != 0:
                                     self.add_parent(comm_coll_node, comp_node)
-                                encode_message(g, comm_coll_node)
+                                self._emit_message(g, comm_coll_node)
                             # add layer_num
                             layer_num += 1
                         # expert layer starts
@@ -775,7 +830,7 @@ class LLMConverter:
                                 comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num-1].output_memory_size)
                                 layers[layer_num].comm_node = comm_coll_node
                                 self.add_parent(comm_coll_node, comp_node)
-                                encode_message(g, comm_coll_node)
+                                self._emit_message(g, comm_coll_node)
                             expert_start = True
                             # check expert end
                             if layers[layer_num].expert_num == 'END':
@@ -787,7 +842,7 @@ class LLMConverter:
                                     comm_coll_node = self.get_comm_coll_node("expert_end", layers[layer_num].comm_type, layers[layer_num+1].input_memory_size)
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
-                                    encode_message(g, comm_coll_node)
+                                    self._emit_message(g, comm_coll_node)
                                 continue
                             # round robin assignment
                             expert_id = int(layers[layer_num].expert_num) % npus_per_group
@@ -820,7 +875,7 @@ class LLMConverter:
                             self.add_parent(send_output_node, comp_node)
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
-                        encode_message(g, send_output_node)
+                        self._emit_message(g, send_output_node)
                         # paired decode npu receive output
                         recv_output_node = self.get_comm_node(
                             is_send=False,
@@ -830,7 +885,7 @@ class LLMConverter:
                             comm_src=npu_id,
                             comm_dst=npu_id + self.num_npus
                         )
-                        encode_message(s, recv_output_node)
+                        self._emit_message(s, recv_output_node)
                     else:
                         if layers[layer_end - 1].is_expert:
                             # Send output (to the next layer in another npu group)
@@ -857,30 +912,35 @@ class LLMConverter:
                             self.add_parent(send_output_node, comp_node)
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
-                        encode_message(g, send_output_node)
-            remain_layers -= 1
+                        self._emit_message(g, send_output_node)
+            if pipeline_boundaries is None:
+                remain_layers -= 1
 
     def convert_event(self, f: TextIOWrapper, num_layers: int):
         layers: list[Layer] = self.get_layers(f)
         for npu_id in range(self.num_npus):
             with self._open_output_stream(npu_id) as g:
                 global_metadata = self.get_global_metadata()
-                encode_message(g, global_metadata)
+                self._emit_message(g, global_metadata)
                 for idx, layer in enumerate(layers):
                     comp_node = self.get_comp_node(
                     layer.name, 
                     layer.comp_time)
                     layer.comp_node = comp_node
-                    encode_message(g, comp_node)
+                    self._emit_message(g, comp_node)
 
     def _convert(self) -> None:
-        with open(self.input_filename, "r") as f:
+        with self._open_input() as f:
             first_line = f.readline().strip().split()
             execution_type = first_line[0]
 
-            if len(first_line) == 3:
+            pipeline_boundaries = None
+            if len(first_line) >= 3:
                 assert(first_line[1] == "model_parallel_NPU_group:")
                 num_npu_group = int(first_line[2])
+                if len(first_line) == 5:
+                    assert(first_line[3] == "pipeline_block_boundaries:")
+                    pipeline_boundaries = [int(value) for value in first_line[4].split(",")]
             else:
                 num_npu_group = 0
 
@@ -892,15 +952,15 @@ class LLMConverter:
             if execution_type == "COLOCATED":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_common(f, num_layers, num_npu_group)
+                self.convert_common(f, num_layers, num_npu_group, pipeline_boundaries)
             elif execution_type == "PREFILL":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_prefill(f, num_layers, num_npu_group)
+                self.convert_prefill(f, num_layers, num_npu_group, pipeline_boundaries)
             elif execution_type == "DECODE":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_common(f, num_layers, num_npu_group)
+                self.convert_common(f, num_layers, num_npu_group, pipeline_boundaries)
             elif execution_type == "EVENT":
                 self.convert_event(f, num_layers)
             else:
@@ -912,14 +972,18 @@ class LLMConverter:
         self._payload_streams = None
         self._convert()
 
-    def convert_to_payloads(self) -> Dict[int, bytes]:
+    def convert_to_payloads(self, compact_metadata: bool = False) -> Dict[int, bytes]:
         """Convert the input trace to rank-indexed ET payloads without files.
 
         Returned bytes are bit-for-bit equivalent to the legacy file contents
-        produced from a fresh converter with the same inputs.
+        produced from a fresh converter with the same inputs unless compact
+        metadata is requested. Compact metadata stores a trace digest instead
+        of duplicating the full source trace for every rank; ETFeeder does not
+        use GlobalMetadata to simulate execution.
         """
         self._reset_conversion_state()
         self._payload_streams = {}
+        self._compact_metadata = compact_metadata
         try:
             self._convert()
             return {
@@ -928,3 +992,22 @@ class LLMConverter:
             }
         finally:
             self._payload_streams = None
+
+    def convert_to_template_bundle(
+        self, known_template_ids=None, compact_metadata: bool = False,
+    ):
+        """Convert directly to the shared-template protocol representation.
+
+        Unlike ``convert_to_payloads`` this never materialises framed rank ET
+        byte strings only to decode them again in the serving controller.
+        """
+        from inference_serving.execution_templates import TemplateBundleCollector
+
+        self._reset_conversion_state()
+        self._compact_metadata = compact_metadata
+        self._template_collector = TemplateBundleCollector(known_template_ids)
+        try:
+            self._convert()
+            return self._template_collector.build()
+        finally:
+            self._template_collector = None
