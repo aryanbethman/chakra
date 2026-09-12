@@ -8,6 +8,7 @@
 
 #include "et_feeder_node.h"
 #include "protoio.hh"
+#include "astra-sim/common/WorkloadPayload.hh"
 
 namespace Chakra {
 struct CompareNodes : public std::binary_function<
@@ -25,6 +26,7 @@ class ETFeeder {
  public:
   ETFeeder(std::string filename);
   ETFeeder(std::shared_ptr<const std::string> payload);
+  ETFeeder(std::shared_ptr<const AstraSim::RankEtTemplate> rank_template);
   ~ETFeeder();
 
   void addNode(std::shared_ptr<ETFeederNode> node);
@@ -43,7 +45,9 @@ class ETFeeder {
  private:
   void initialiseTrace();
 
-  ProtoInputStream trace_;
+  std::unique_ptr<ProtoInputStream> trace_;
+  std::shared_ptr<const AstraSim::RankEtTemplate> rank_template_;
+  size_t template_node_index_ = 0;
   const uint32_t window_size_;
   bool et_complete_;
 
