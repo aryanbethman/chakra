@@ -6,17 +6,25 @@ using namespace std;
 using namespace Chakra;
 
 ETFeeder::ETFeeder(string filename)
-    : trace_(filename), window_size_(4096 * 256), et_complete_(false) {
+    : trace_(make_unique<ProtoInputStream>(filename)), window_size_(4096 * 256), et_complete_(false) {
   initialiseTrace();
 }
 
 ETFeeder::ETFeeder(shared_ptr<const string> payload)
-    : trace_(std::move(payload)), window_size_(4096 * 256), et_complete_(false) {
+    : trace_(make_unique<ProtoInputStream>(std::move(payload))), window_size_(4096 * 256), et_complete_(false) {
   initialiseTrace();
 }
 
+ETFeeder::ETFeeder(shared_ptr<const AstraSim::RankEtTemplate> rank_template)
+    : rank_template_(std::move(rank_template)), window_size_(4096 * 256), et_complete_(false) {
+  if (rank_template_ == nullptr || rank_template_->nodes == nullptr) {
+    throw invalid_argument("Missing direct execution template");
+  }
+  readNextWindow();
+}
+
 void ETFeeder::initialiseTrace() {
-  if (!trace_.is_open()) {
+  if (trace_ == nullptr || !trace_->is_open()) {
     throw runtime_error("Failed to open execution trace");
   }
 
@@ -94,19 +102,56 @@ void ETFeeder::freeChildrenNodes(uint64_t node_id) {
 }
 
 void ETFeeder::readGlobalMetadata() {
-  if (!trace_.is_open()) {
+  if (trace_ == nullptr || !trace_->is_open()) {
     throw runtime_error(
         "Trace file closed unexpectedly during reading global metadata.");
   }
   shared_ptr<ChakraProtoMsg::GlobalMetadata> pkt_msg =
       make_shared<ChakraProtoMsg::GlobalMetadata>();
-  trace_.read(*pkt_msg);
+  trace_->read(*pkt_msg);
 }
 
 shared_ptr<ETFeederNode> ETFeeder::readNode() {
   shared_ptr<ChakraProtoMsg::Node> pkt_msg =
       make_shared<ChakraProtoMsg::Node>();
-  if (!trace_.read(*pkt_msg)) {
+  if (rank_template_ != nullptr) {
+    if (template_node_index_ >= rank_template_->nodes->size()) {
+      return nullptr;
+    }
+    pkt_msg->CopyFrom(*rank_template_->nodes->at(template_node_index_));
+    const auto overlay = rank_template_->overlays.find(template_node_index_++);
+    if (overlay != rank_template_->overlays.end()) {
+      if (overlay->second.has_name) {
+        pkt_msg->set_name(overlay->second.name);
+      }
+      if (!overlay->second.attributes.empty()) {
+        unordered_map<int, ChakraProtoMsg::AttributeProto> replacements;
+        for (const auto& replacement : overlay->second.attributes) {
+          if (!replacements.emplace(replacement.first, replacement.second).second) {
+            throw invalid_argument("duplicate template node attribute position");
+          }
+        }
+        vector<ChakraProtoMsg::AttributeProto> retained;
+        retained.reserve(pkt_msg->attr_size());
+        for (const auto& attribute : pkt_msg->attr()) {
+          retained.push_back(attribute);
+        }
+        const int total = static_cast<int>(retained.size() + replacements.size());
+        pkt_msg->clear_attr();
+        size_t retained_index = 0;
+        for (int position = 0; position < total; ++position) {
+          const auto replacement = replacements.find(position);
+          if (replacement != replacements.end()) {
+            pkt_msg->add_attr()->CopyFrom(replacement->second);
+          } else if (retained_index < retained.size()) {
+            pkt_msg->add_attr()->CopyFrom(retained.at(retained_index++));
+          } else {
+            throw invalid_argument("invalid template node attribute position");
+          }
+        }
+      }
+    }
+  } else if (!trace_->read(*pkt_msg)) {
     return nullptr;
   }
   shared_ptr<ETFeederNode> node = make_shared<ETFeederNode>(pkt_msg);
@@ -155,7 +200,7 @@ void ETFeeder::resolveDep() {
 }
 
 void ETFeeder::readNextWindow() {
-  if (!trace_.is_open()) {
+  if (rank_template_ == nullptr && (trace_ == nullptr || !trace_->is_open())) {
     throw runtime_error(
         "Trace file closed unexpectedly during reading next window.");
   }
