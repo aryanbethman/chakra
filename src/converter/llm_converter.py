@@ -1083,6 +1083,44 @@ class LLMConverter:
         self._payload_streams = None
         self._convert()
 
+    def convert_rows_to_payloads(self, header_line: str,
+                                 rows: List[List[str]]) -> Dict[int, bytes]:
+        """Rows in, one framed ET byte string per rank out -- no files.
+
+        The rows counterpart of `convert_to_payloads`, for the path where
+        the simulator already holds the fields. Called by
+        serving/core/graph_generator.py.
+        """
+        self._reset_conversion_state()
+        self._payload_streams = {}
+        try:
+            self.convert_rows(header_line, rows)
+            return {
+                npu_id: stream.getvalue()
+                for npu_id, stream in self._payload_streams.items()
+            }
+        finally:
+            self._payload_streams = None
+
+    def convert_rows_to_template_bundle(self, header_line: str,
+                                        rows: List[List[str]],
+                                        known_template_ids=None):
+        """Rows in, a shared-template bundle out.
+
+        Skips both round trips the older path paid: no trace text to
+        re-parse on the way in, and no per-rank ET bytes to split apart on
+        the way out. Called by serving/core/graph_generator.py.
+        """
+        from serving.core.execution_templates import TemplateBundleCollector
+
+        self._reset_conversion_state()
+        self._template_collector = TemplateBundleCollector(known_template_ids)
+        try:
+            self.convert_rows(header_line, rows)
+            return self._template_collector.build()
+        finally:
+            self._template_collector = None
+
     def convert_to_template_bundle(self, known_template_ids=None):
         """Convert straight to the shared-template representation.
 
