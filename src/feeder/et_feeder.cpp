@@ -1,5 +1,6 @@
 #include "et_feeder.h"
 
+#include <chrono>
 #include <iostream>
 
 using namespace std;
@@ -20,7 +21,11 @@ ETFeeder::ETFeeder(shared_ptr<const AstraSim::RankEtTemplate> rank_template)
   if (rank_template_ == nullptr || rank_template_->nodes == nullptr) {
     throw invalid_argument("Missing direct execution template");
   }
+  const auto started = std::chrono::steady_clock::now();
   readNextWindow();
+  AstraSim::record_direct_template_feeder_init(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started).count());
 }
 
 void ETFeeder::initialiseTrace() {
