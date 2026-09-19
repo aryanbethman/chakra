@@ -19,6 +19,11 @@ class ETFeederNode {
   std::vector<uint64_t> getDepUnresolvedParentIDs();
   void setDepUnresolvedParentIDs(
       std::vector<uint64_t> const& dep_unresolved_parent_ids);
+  // Consume one not-yet-consumed occurrence of `parent_id` among the node's
+  // data dependencies. Returns whether one was found.
+  bool consumeDataDep(uint64_t parent_id);
+  // Data dependencies not yet consumed.
+  int remainingDataDeps() const;
 
   const ChakraProtoMsg::AttributeProto& get_other_attr(
       const std::string& attr_name) const;
@@ -59,6 +64,14 @@ class ETFeederNode {
   std::unordered_set<std::shared_ptr<ETFeederNode>> children_set_{};
   std::vector<std::shared_ptr<ETFeederNode>> children_vec_{};
   std::vector<uint64_t> dep_unresolved_parent_ids_{};
+  // Dependency bookkeeping lives here rather than in node_, so node_ can be
+  // an immutable execution-template node shared by every rank and batch
+  // instead of a per-feeder copy. Bit i of consumed_deps_ marks
+  // node_->data_deps(i) consumed; nodes with more than 64 dependencies spill
+  // to consumed_deps_overflow_.
+  int remaining_data_deps_ = 0;
+  uint64_t consumed_deps_ = 0;
+  std::vector<bool> consumed_deps_overflow_{};
   std::unordered_map<std::string, const ChakraProtoMsg::AttributeProto&>
       other_attrs_{};
 

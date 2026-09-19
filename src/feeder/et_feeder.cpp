@@ -90,17 +90,9 @@ shared_ptr<ETFeederNode> ETFeeder::lookupNode(uint64_t node_id) {
 void ETFeeder::freeChildrenNodes(uint64_t node_id) {
   shared_ptr<ETFeederNode> node = dep_graph_[node_id];
   for (auto child : node->getChildren()) {
-    auto child_chakra = child->getChakraNode();
-    for (auto it = child_chakra->mutable_data_deps()->begin();
-         it != child_chakra->mutable_data_deps()->end();
-         ++it) {
-      if (*it == node_id) {
-        child_chakra->mutable_data_deps()->erase(it);
-        break;
-      }
-    }
-    if (child_chakra->data_deps().size() == 0) {
-      dep_free_node_id_set_.emplace(child_chakra->id());
+    child->consumeDataDep(node_id);
+    if (child->remainingDataDeps() == 0) {
+      dep_free_node_id_set_.emplace(child->getChakraNode()->id());
       dep_free_node_queue_.emplace(child);
     }
   }
@@ -117,15 +109,21 @@ void ETFeeder::readGlobalMetadata() {
 }
 
 shared_ptr<ETFeederNode> ETFeeder::readNode() {
-  shared_ptr<ChakraProtoMsg::Node> pkt_msg =
-      make_shared<ChakraProtoMsg::Node>();
+  shared_ptr<ChakraProtoMsg::Node> pkt_msg;
   if (rank_template_ != nullptr) {
     if (template_node_index_ >= rank_template_->nodes->size()) {
       return nullptr;
     }
-    pkt_msg->CopyFrom(*rank_template_->nodes->at(template_node_index_));
+    const auto& template_node = rank_template_->nodes->at(template_node_index_);
     const auto overlay = rank_template_->overlays.find(template_node_index_++);
-    if (overlay != rank_template_->overlays.end()) {
+    if (overlay == rank_template_->overlays.end()) {
+      // Nothing rank-specific to apply and nothing downstream writes to a
+      // node (dependency bookkeeping is in ETFeederNode), so share the
+      // immutable template node instead of copying it per rank and batch.
+      pkt_msg = const_pointer_cast<ChakraProtoMsg::Node>(template_node);
+    } else {
+      pkt_msg = make_shared<ChakraProtoMsg::Node>();
+      pkt_msg->CopyFrom(*template_node);
       if (overlay->second.has_name) {
         pkt_msg->set_name(overlay->second.name);
       }
@@ -156,8 +154,11 @@ shared_ptr<ETFeederNode> ETFeeder::readNode() {
         }
       }
     }
-  } else if (!trace_->read(*pkt_msg)) {
-    return nullptr;
+  } else {
+    pkt_msg = make_shared<ChakraProtoMsg::Node>();
+    if (!trace_->read(*pkt_msg)) {
+      return nullptr;
+    }
   }
   shared_ptr<ETFeederNode> node = make_shared<ETFeederNode>(pkt_msg);
 
@@ -227,7 +228,7 @@ void ETFeeder::readNextWindow() {
     uint64_t node_id = node_id_node.first;
     shared_ptr<ETFeederNode> node = node_id_node.second;
     if ((dep_free_node_id_set_.count(node_id) == 0) &&
-        (node->getChakraNode()->data_deps().size() == 0)) {
+        (node->remainingDataDeps() == 0)) {
       dep_free_node_id_set_.emplace(node_id);
       dep_free_node_queue_.emplace(node);
     }

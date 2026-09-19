@@ -9,6 +9,7 @@ ETFeederNode::ETFeederNode(std::shared_ptr<ChakraProtoMsg::Node> node) {
   this->name_ = node->name();
   this->runtime_ = node->duration_micros();
   this->is_cpu_op_ = 0;
+  this->remaining_data_deps_ = node->data_deps_size();
 
   if (node->has_inputs()) {
     this->inputs_values_ = static_cast<string>(node->inputs().values());
@@ -78,6 +79,39 @@ vector<shared_ptr<ETFeederNode>> ETFeederNode::getChildren() {
 
 void ETFeederNode::addDepUnresolvedParentID(uint64_t node_id) {
   dep_unresolved_parent_ids_.emplace_back(node_id);
+}
+
+bool ETFeederNode::consumeDataDep(uint64_t parent_id) {
+  // Same result as erasing the first matching entry from data_deps, which
+  // is what the feeder used to do to the proto itself.
+  const int size = node_->data_deps_size();
+  for (int i = 0; i < size; ++i) {
+    if (node_->data_deps(i) != parent_id) {
+      continue;
+    }
+    if (i < 64) {
+      const uint64_t bit = uint64_t{1} << i;
+      if (consumed_deps_ & bit) {
+        continue;
+      }
+      consumed_deps_ |= bit;
+    } else {
+      if (consumed_deps_overflow_.empty()) {
+        consumed_deps_overflow_.assign(size - 64, false);
+      }
+      if (consumed_deps_overflow_[i - 64]) {
+        continue;
+      }
+      consumed_deps_overflow_[i - 64] = true;
+    }
+    --remaining_data_deps_;
+    return true;
+  }
+  return false;
+}
+
+int ETFeederNode::remainingDataDeps() const {
+  return remaining_data_deps_;
 }
 
 vector<uint64_t> ETFeederNode::getDepUnresolvedParentIDs() {
